@@ -1,0 +1,704 @@
+---
+title: "3. cross-sec"
+output: html_notebook
+---
+
+# Analysis notes
+11/18/25: Re-running after getting anti-hypertensive mediations aliases from Matt Borzage. 
+11/10/25: Running cross-sectional associations for exposure-mediator and mediator-outcome associations per reviewer request. 
+
+# Getting packages into session
+```{r packages, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, results = "hide")
+
+library(haven) # inputting data 
+library(tidyverse) # data mgmt
+library(psych) # easy summary statistics
+library(DT) # data tables
+library(tableone) # easy table 1 
+library(kableExtra) # format kable objects 
+library(naniar) # for missingness 
+library(survey) # for MSMs 
+library(nnet) # multinormal regression
+library(cobalt) # examining covariate balance
+library(gt) # nice tables
+library(gtExtras) # nice tables
+library(gtsummary) # nice summary tables
+library(broom) # making output nice
+library(mice) # working with imputed data
+options(max.print = 100000)
+options(scipen = 999) # turn off scientific notation 
+set.cobalt.options(binary='raw', continuous='std') # for checking balance after weighting 
+```
+
+# Uploading data
+```{r upload data, echo = T, results = 'hide'}
+load(file = "./analysis data/causmed_imp.Rdata") 
+view(names(causmed_imp[[1]])) # getting names for reference
+
+# creating dataset with imputed datasets stacked together
+imp_stacked <- complete(causmed_imp, "long") # n=71840, v=67
+str(imp_stacked)
+summary(imp_stacked$".imp")
+table(imp_stacked$".imp")
+```
+
+# Exposure-mediator model (hypertension)
+```{r htn}
+m <- max(imp_stacked$".imp") # number of imputed datasets
+em_htn <- list() # list for models
+
+# For-loop to run models
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # multinomial regression to obtain conditional prob 
+  # of being in a race/ethnic group
+  em_htn[[i]] <- glm(as.factor(has_htn) ~ 
+                       age_1 + # using visit 1 age here 
+                       as.factor(gender) +
+                       as.factor(ethnicity),
+                     family = binomial(link = "logit"),
+                     data = data)
+}
+
+# Pooling estimates
+pool_em_htn <- as.mira(em_htn) %>% pool()
+summary(pool_em_htn)
+
+# Making output 
+pool_htn_res <- summary(pool_em_htn, conf.int = TRUE) %>%
+  as.data.frame() %>% 
+  mutate("Estimate" = exp(estimate)) %>% 
+  mutate("LCL" = exp(conf.low)) %>% 
+  mutate("UCL" = exp(conf.high)) %>%
+  rename("p-value" = p.value) %>% 
+  mutate(across(is.numeric, round, 2)) %>%
+  mutate("Group" = case_when(
+    term == "as.factor(ethnicity)Black" ~ "Black",
+    term == "as.factor(ethnicity)Hispanic" ~ "Hispanic")) %>% 
+  select(Group, Estimate, LCL, UCL, "p-value") %>% 
+  filter(Group %in% c("Black", "Hispanic")) 
+pool_htn_res
+
+# cleaning up workspace
+rm(data, em_htn, pool_em_htn, i, m)
+```
+
+# Exposure-mediator model (SBP)
+```{r sbp}
+m <- max(imp_stacked$".imp") # number of imputed datasets
+em_sbp <- list() # list for models
+
+# For-loop to run models
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # multinomial regression to obtain conditional prob 
+  # of being in a race/ethnic group
+  em_sbp[[i]] <- lm(scale(sbpavg) ~ 
+                      age_1 + # using visit 1 age here 
+                      as.factor(gender) +
+                      as.factor(ethnicity) + 
+                      as.factor(takes_BP_meds),
+                     data = data)
+}
+
+# Pooling estimates
+pool_em_sbp <- as.mira(em_sbp) %>% pool()
+summary(pool_em_sbp)
+
+# Making output 
+pool_sbp_res <- summary(pool_em_sbp, conf.int = TRUE) %>%
+  as.data.frame() %>% 
+  mutate("Estimate" = estimate) %>% 
+  mutate("LCL" = conf.low) %>% 
+  mutate("UCL" = conf.high) %>%
+  rename("p-value" = p.value) %>% 
+  mutate(across(is.numeric, round, 2)) %>%
+  mutate("Group" = case_when(
+    term == "as.factor(ethnicity)Black" ~ "Black",
+    term == "as.factor(ethnicity)Hispanic" ~ "Hispanic")) %>% 
+  select(Group, Estimate, LCL, UCL, "p-value") %>% 
+  filter(Group %in% c("Black", "Hispanic")) 
+pool_sbp_res
+
+# cleaning up workspace
+rm(data, em_sbp, pool_em_sbp, i, m)
+```
+
+# Mediator-outcome (amyloid SUVR)
+## Hypertension
+```{r htn ab}
+m <- max(imp_stacked$".imp") # number of imputed datasets
+mo_ab <- list() # list for models
+
+# For-loop to run models
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # fully adjusted models
+  mo_ab[[i]] <- lm(scale(absuvr_2) ~ 
+                      as.factor(has_htn) + 
+                      as.factor(ethnicity) +
+                       age_1 + # using baseline age 
+                       as.factor(gender) +
+                       # SES variables 
+                       edu + 
+                       income +
+                       as.factor(hasnoinsurance) + 
+                       socsupptot + 
+                       # proximal risk factors
+                       bmi +
+                       rapa_1_total + # physical act scores
+                       rapa_2_total + 
+                       as.factor(smkever) + 
+                       #gds_total + 
+                       # lab values for cardiometabolic RF
+                       ldl + 
+                       gluc + 
+                       a1c + 
+                       egfr_nonaa + 
+                       #egfr_aa + 
+                       choltot + 
+                       # clinical dx vars
+                       #as.factor(cdx_dep) +
+                       as.factor(cdx_dyslipid) + 
+                       as.factor(cdx_cvd) + 
+                       as.factor(cdx_dm) + 
+                     as.factor(apoe4_positivity),
+                     data = data)
+}
+
+# Pooling estimates
+pool_mo_ab <- as.mira(mo_ab) %>% pool()
+summary(pool_mo_ab)
+
+# Making output 
+pool_ab_res <- summary(pool_mo_ab, conf.int = TRUE) %>%
+  as.data.frame() %>% 
+  mutate("Estimate" = estimate) %>% 
+  mutate("LCL" = conf.low) %>% 
+  mutate("UCL" = conf.high) %>%
+  rename("p-value" = p.value) %>% 
+  mutate(across(is.numeric, round, 2)) %>%
+  mutate("Group" = case_when(
+    term == "as.factor(has_htn)1"  ~ "Hypertension")) %>% 
+  select(Group, Estimate, LCL, UCL, "p-value") %>% 
+  filter(Group %in% c("Hypertension")) 
+pool_ab_res
+
+# cleaning up workspace
+rm(data, mo_ab, pool_mo_ab, i, m)
+```
+## SBP
+```{r sbp ab}
+m <- max(imp_stacked$".imp") # number of imputed datasets
+mo_ab_sbp <- list() # list for models
+
+# For-loop to run models
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # fully adjusted models
+  mo_ab_sbp[[i]] <- lm(scale(absuvr_2) ~ 
+                      scale(sbpavg) + 
+                        as.factor(ethnicity) +
+                        age_1 + # using baseline age 
+                        as.factor(gender) +
+                        as.factor(takes_BP_meds) + 
+                       # SES variables 
+                       edu + 
+                       income +
+                       as.factor(hasnoinsurance) + 
+                       socsupptot + 
+                       # proximal risk factors
+                       bmi +
+                       rapa_1_total + # physical act scores
+                       rapa_2_total + 
+                       as.factor(smkever) + 
+                       #gds_total + 
+                       # lab values for cardiometabolic RF
+                       ldl + 
+                       gluc + 
+                       a1c + 
+                       egfr_nonaa + 
+                       #egfr_aa + 
+                       choltot + 
+                       # clinical dx vars
+                       #as.factor(cdx_dep) +
+                       as.factor(cdx_dyslipid) + 
+                       as.factor(cdx_cvd) + 
+                       as.factor(cdx_dm) + 
+                     as.factor(apoe4_positivity),
+                     data = data)
+}
+
+# Pooling estimates
+pool_mo_ab_sbp <- as.mira(mo_ab_sbp) %>% pool()
+summary(pool_mo_ab_sbp)
+
+# Making output 
+pool_ab_sbp_res <- summary(pool_mo_ab_sbp, conf.int = TRUE) %>%
+  as.data.frame() %>% 
+  mutate("Estimate" = estimate) %>% 
+  mutate("LCL" = conf.low) %>% 
+  mutate("UCL" = conf.high) %>%
+  rename("p-value" = p.value) %>% 
+  mutate(across(is.numeric, round, 2)) %>%
+  mutate("Group" = case_when(
+    term == "scale(sbpavg)"  ~ "SBP")) %>% 
+  select(Group, Estimate, LCL, UCL, "p-value") %>% 
+  filter(Group %in% c("SBP")) 
+pool_ab_sbp_res
+
+# cleaning up workspace
+rm(data, mo_ab_sbp, pool_mo_ab_sbp, i, m)
+```
+
+# Mediator-outcome (MT tau SUVR)
+## HTN
+```{r mttau}
+m <- max(imp_stacked$".imp") # number of imputed datasets
+mo_mttau <- list() # list for models
+
+# For-loop to run models
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # fully adjusted models
+  mo_mttau[[i]] <- lm(scale(taumedtempsuvr_2) ~ 
+                      as.factor(has_htn) + 
+                      as.factor(ethnicity) +
+                       age_1 + # using baseline age 
+                       as.factor(gender) +
+                       # SES variables 
+                       edu + 
+                       income +
+                       as.factor(hasnoinsurance) + 
+                       socsupptot + 
+                       # proximal risk factors
+                       bmi +
+                       rapa_1_total + # physical act scores
+                       rapa_2_total + 
+                       as.factor(smkever) + 
+                       #gds_total + 
+                       # lab values for cardiometabolic RF
+                       ldl + 
+                       gluc + 
+                       a1c + 
+                       egfr_nonaa + 
+                       #egfr_aa + 
+                       choltot + 
+                       # clinical dx vars
+                       #as.factor(cdx_dep) +
+                       as.factor(cdx_dyslipid) + 
+                       as.factor(cdx_cvd) + 
+                       as.factor(cdx_dm) + 
+                     as.factor(apoe4_positivity),
+                     data = data)
+}
+
+# Pooling estimates
+pool_mo_mttau <- as.mira(mo_mttau) %>% pool()
+summary(pool_mo_mttau)
+
+# Making output 
+pool_mttau_res <- summary(pool_mo_mttau, conf.int = TRUE) %>%
+  as.data.frame() %>% 
+  mutate("Estimate" = estimate) %>% 
+  mutate("LCL" = conf.low) %>% 
+  mutate("UCL" = conf.high) %>%
+  rename("p-value" = p.value) %>% 
+  mutate(across(is.numeric, round, 2)) %>%
+  mutate("Group" = case_when(
+    term == "as.factor(has_htn)1"  ~ "Hypertension")) %>% 
+  select(Group, Estimate, LCL, UCL, "p-value") %>% 
+  filter(Group %in% c("Hypertension")) 
+pool_mttau_res
+
+# cleaning up workspace
+rm(data, mo_mttau, pool_mo_mttau, i, m)
+```
+# SBP
+```{r sbp mttau}
+m <- max(imp_stacked$".imp") # number of imputed datasets
+mo_mttau_sbp <- list() # list for models
+
+# For-loop to run models
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # fully adjusted models
+  mo_mttau_sbp[[i]] <- lm(scale(taumedtempsuvr_2) ~ 
+                      scale(sbpavg) + 
+                      as.factor(ethnicity) +
+                       age_1 + # using baseline age 
+                       as.factor(gender) +
+                        as.factor(takes_BP_meds) + 
+                       # SES variables 
+                       edu + 
+                       income +
+                       as.factor(hasnoinsurance) + 
+                       socsupptot + 
+                       # proximal risk factors
+                       bmi +
+                       rapa_1_total + # physical act scores
+                       rapa_2_total + 
+                       as.factor(smkever) + 
+                       #gds_total + 
+                       # lab values for cardiometabolic RF
+                       ldl + 
+                       gluc + 
+                       a1c + 
+                       egfr_nonaa + 
+                       #egfr_aa + 
+                       choltot + 
+                       # clinical dx vars
+                       #as.factor(cdx_dep) +
+                       as.factor(cdx_dyslipid) + 
+                       as.factor(cdx_cvd) + 
+                       as.factor(cdx_dm) + 
+                     as.factor(apoe4_positivity),
+                     data = data)
+}
+
+# Pooling estimates
+pool_mo_mttau_sbp <- as.mira(mo_mttau_sbp) %>% pool()
+summary(pool_mo_mttau_sbp)
+
+# Making output 
+pool_mttau_sbp_res <- summary(pool_mo_mttau_sbp, conf.int = TRUE) %>%
+  as.data.frame() %>% 
+  mutate("Estimate" = estimate) %>% 
+  mutate("LCL" = conf.low) %>% 
+  mutate("UCL" = conf.high) %>%
+  rename("p-value" = p.value) %>% 
+  mutate(across(is.numeric, round, 2)) %>%
+  mutate("Group" = case_when(
+    term == "scale(sbpavg)"  ~ "SBP")) %>% 
+  select(Group, Estimate, LCL, UCL, "p-value") %>% 
+  filter(Group %in% c("SBP")) 
+pool_mttau_sbp_res
+
+# cleaning up workspace
+rm(data, mo_mttau_sbp, pool_mo_mttau_sbp, i, m)
+```
+
+# Mediator-outcome (AD sig CT)
+## HTN
+```{r adsig}
+m <- max(imp_stacked$".imp") # number of imputed datasets
+mo_adct <- list() # list for models
+
+# For-loop to run models
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # fully adjusted models
+  mo_adct[[i]] <- lm(scale(ctmetaroi_2) ~ 
+                      as.factor(has_htn) + 
+                      as.factor(ethnicity) +
+                       age_1 + # using baseline age 
+                       as.factor(gender) +
+                       # SES variables 
+                       edu + 
+                       income +
+                       as.factor(hasnoinsurance) + 
+                       socsupptot + 
+                       # proximal risk factors
+                       bmi +
+                       rapa_1_total + # physical act scores
+                       rapa_2_total + 
+                       as.factor(smkever) + 
+                       #gds_total + 
+                       # lab values for cardiometabolic RF
+                       ldl + 
+                       gluc + 
+                       a1c + 
+                       egfr_nonaa + 
+                       #egfr_aa + 
+                       choltot + 
+                       # clinical dx vars
+                       #as.factor(cdx_dep) +
+                       as.factor(cdx_dyslipid) + 
+                       as.factor(cdx_cvd) + 
+                       as.factor(cdx_dm) + 
+                     as.factor(apoe4_positivity),
+                     data = data)
+}
+
+# Pooling estimates
+pool_mo_adct <- as.mira(mo_adct) %>% pool()
+summary(pool_mo_adct)
+
+# Making output 
+pool_adct_res <- summary(pool_mo_adct, conf.int = TRUE) %>%
+  as.data.frame() %>% 
+  mutate("Estimate" = estimate) %>% 
+  mutate("LCL" = conf.low) %>% 
+  mutate("UCL" = conf.high) %>%
+  rename("p-value" = p.value) %>% 
+  mutate(across(is.numeric, round, 2)) %>%
+  mutate("Group" = case_when(
+    term == "as.factor(has_htn)1"  ~ "Hypertension")) %>% 
+  select(Group, Estimate, LCL, UCL, "p-value") %>% 
+  filter(Group %in% c("Hypertension")) 
+pool_adct_res
+
+# cleaning up workspace
+rm(data, mo_adct, pool_mo_adct, i, m)
+```
+## SBP
+```{r sbp adct}
+m <- max(imp_stacked$".imp") # number of imputed datasets
+mo_adct_sbp <- list() # list for models
+
+# For-loop to run models
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # fully adjusted models
+  mo_adct_sbp[[i]] <- lm(scale(ctmetaroi_2) ~ 
+                      scale(sbpavg) + 
+                      as.factor(ethnicity) +
+                       age_1 + # using baseline age 
+                       as.factor(gender) +
+                        as.factor(takes_BP_meds) + 
+                       # SES variables 
+                       edu + 
+                       income +
+                       as.factor(hasnoinsurance) + 
+                       socsupptot + 
+                       # proximal risk factors
+                       bmi +
+                       rapa_1_total + # physical act scores
+                       rapa_2_total + 
+                       as.factor(smkever) + 
+                       #gds_total + 
+                       # lab values for cardiometabolic RF
+                       ldl + 
+                       gluc + 
+                       a1c + 
+                       egfr_nonaa + 
+                       #egfr_aa + 
+                       choltot + 
+                       # clinical dx vars
+                       #as.factor(cdx_dep) +
+                       as.factor(cdx_dyslipid) + 
+                       as.factor(cdx_cvd) + 
+                       as.factor(cdx_dm), 
+                     #as.factor(apoe4_positivity),
+                     data = data)
+}
+
+# Pooling estimates
+pool_mo_adct_sbp <- as.mira(mo_adct_sbp) %>% pool()
+summary(pool_mo_adct_sbp)
+
+# Making output 
+pool_adct_sbp_res <- summary(pool_mo_adct_sbp, conf.int = TRUE) %>%
+  as.data.frame() %>% 
+  mutate("Estimate" = estimate) %>% 
+  mutate("LCL" = conf.low) %>% 
+  mutate("UCL" = conf.high) %>%
+  rename("p-value" = p.value) %>% 
+  mutate(across(is.numeric, round, 2)) %>%
+  mutate("Group" = case_when(
+    term == "scale(sbpavg)"  ~ "SBP")) %>% 
+  select(Group, Estimate, LCL, UCL, "p-value") %>% 
+  filter(Group %in% c("SBP")) 
+pool_adct_sbp_res
+
+# cleaning up workspace
+rm(data, mo_adct_sbp, pool_mo_adct_sbp, i, m)
+```
+
+# Mediator-outcome (WMHV)
+## HTN
+```{r wmhv}
+m <- max(imp_stacked$".imp") # number of imputed datasets
+mo_wmhv <- list() # list for models
+
+# For-loop to run models
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # fully adjusted models
+  mo_wmhv[[i]] <- lm(logwmhv_2 ~ 
+                      as.factor(has_htn) + 
+                      as.factor(ethnicity) +
+                       age_1 + # using baseline age 
+                       as.factor(gender) +
+                       # SES variables 
+                       edu + 
+                       income +
+                       as.factor(hasnoinsurance) + 
+                       socsupptot + 
+                       # proximal risk factors
+                       bmi +
+                       rapa_1_total + # physical act scores
+                       rapa_2_total + 
+                       as.factor(smkever) + 
+                       #gds_total + 
+                       # lab values for cardiometabolic RF
+                       ldl + 
+                       gluc + 
+                       a1c + 
+                       egfr_nonaa + 
+                       #egfr_aa + 
+                       choltot + 
+                       # clinical dx vars
+                       #as.factor(cdx_dep) +
+                       as.factor(cdx_dyslipid) + 
+                       as.factor(cdx_cvd) + 
+                       as.factor(cdx_dm) + 
+                     as.factor(apoe4_positivity),
+                     data = data)
+}
+
+# Pooling estimates
+pool_mo_wmhv <- as.mira(mo_wmhv) %>% pool()
+summary(pool_mo_wmhv)
+
+# Making output 
+pool_wmhv_res <- summary(pool_mo_wmhv, conf.int = TRUE) %>%
+  as.data.frame() %>% 
+  mutate("Estimate" = exp(estimate)) %>% 
+  mutate("LCL" = exp(conf.low)) %>% 
+  mutate("UCL" = exp(conf.high)) %>%
+  rename("p-value" = p.value) %>% 
+  mutate(across(is.numeric, round, 2)) %>%
+  mutate("Group" = case_when(
+    term == "as.factor(has_htn)1"  ~ "Hypertension")) %>% 
+  select(Group, Estimate, LCL, UCL, "p-value") %>% 
+  filter(Group %in% c("Hypertension")) 
+pool_wmhv_res
+
+# cleaning up workspace
+rm(data, mo_wmhv, pool_mo_wmhv, i, m)
+```
+## SBP
+```{r sbp wmhv}
+m <- max(imp_stacked$".imp") # number of imputed datasets
+mo_wmhv_sbp <- list() # list for models
+
+# For-loop to run models
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # fully adjusted models
+  mo_wmhv_sbp[[i]] <- lm(logwmhv_2 ~ 
+                      scale(sbpavg) + 
+                      as.factor(ethnicity) +
+                       age_1 + # using baseline age 
+                       as.factor(gender) +
+                        as.factor(takes_BP_meds) + 
+                       # SES variables 
+                       edu + 
+                       income +
+                       as.factor(hasnoinsurance) + 
+                       socsupptot + 
+                       # proximal risk factors
+                       bmi +
+                       rapa_1_total + # physical act scores
+                       rapa_2_total + 
+                       as.factor(smkever) + 
+                       #gds_total + 
+                       # lab values for cardiometabolic RF
+                       ldl + 
+                       gluc + 
+                       a1c + 
+                       egfr_nonaa + 
+                       #egfr_aa + 
+                       choltot + 
+                       # clinical dx vars
+                       #as.factor(cdx_dep) +
+                       as.factor(cdx_dyslipid) + 
+                       as.factor(cdx_cvd) + 
+                       as.factor(cdx_dm), 
+                     #as.factor(apoe4_positivity),
+                     data = data)
+}
+
+# Pooling estimates
+pool_mo_wmhv_sbp <- as.mira(mo_wmhv_sbp) %>% pool()
+summary(pool_mo_wmhv_sbp)
+
+# Making output 
+pool_wmhv_sbp_res <- summary(pool_mo_wmhv_sbp, conf.int = TRUE) %>%
+  as.data.frame() %>% 
+  mutate("Estimate" = exp(estimate)) %>% 
+  mutate("LCL" = exp(conf.low)) %>% 
+  mutate("UCL" = exp(conf.high)) %>%
+  rename("p-value" = p.value) %>% 
+  mutate(across(is.numeric, round, 2)) %>%
+  mutate("Group" = case_when(
+    term == "scale(sbpavg)"  ~ "SBP")) %>% 
+  select(Group, Estimate, LCL, UCL, "p-value") %>% 
+  filter(Group %in% c("SBP")) 
+pool_wmhv_sbp_res
+
+# cleaning up workspace
+rm(data, mo_wmhv_sbp, pool_mo_wmhv_sbp, i, m)
+```
+
+
+# Putting results together
+```{r all}
+all_res <- bind_rows(pool_htn_res,
+                     pool_sbp_res,
+                     pool_ab_res,
+                     pool_ab_sbp_res,
+                     pool_mttau_res,
+                     pool_mttau_sbp_res,
+                     pool_adct_res,
+                     pool_adct_sbp_res,
+                     pool_wmhv_res,
+                     pool_wmhv_sbp_res) %>% 
+  gt() %>% 
+  tab_row_group(
+    label = "WMHV",
+    rows = 11:12) %>% 
+  tab_row_group(
+    label = "AD Sig. CT",
+    rows = 9:10) %>% 
+  tab_row_group(
+    label = "MT Tau-PET SUVR",
+    rows = 7:8) %>% 
+  tab_row_group(
+    label = "Amyloid-PET SUVR",
+    rows = 5:6) %>% 
+  tab_row_group(
+    label = "SBP",
+    rows = 3:4) %>% 
+  tab_row_group(
+    label = "Hypertension",
+    rows = 1:2) 
+  
+all_res
+
+all_res %>% gtsave("./results/all_res.docx")
+
+```
+

@@ -1,0 +1,924 @@
+---
+title: "2a. CM_wmhv_02 24 25"
+output: html_document
+date: "2025-02-24"
+---
+# Getting packages into session
+```{r packages, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, results = "hide")
+
+library(haven) # inputting data 
+library(tidyverse) # data mgmt
+library(psych) # easy summary statistics
+library(DT) # data tables
+library(tableone) # easy table 1 
+library(kableExtra) # format kable objects 
+library(naniar) # for missingness 
+library(survey) # for MSMs 
+library(nnet) # multinormal regression
+library(cobalt) # examining covariate balance
+library(gt) # nice tables
+library(gtExtras) # nice tables
+library(gtsummary) # nice summary tables
+library(broom) # making output nice
+library(mice) # working with imputed data
+options(max.print = 100000)
+options(scipen = 999) # turn off scientific notation 
+set.cobalt.options(binary='raw', continuous='std') # for checking balance after weighting 
+```
+```{css scroll box for code, include = FALSE}
+pre {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+pre[class] {
+  max-height: 100px;
+}
+```
+# Uploading data
+```{r upload data, echo = T, results = 'hide'}
+load(file = "./analysis data/causmed_imp.Rdata") 
+view(names(causmed_imp[[1]])) # getting names for reference
+
+# creating dataset with imputed datasets stacked together
+imp_stacked <- complete(causmed_imp, "long") # n=71840, v=68
+str(imp_stacked)
+summary(imp_stacked$".imp")
+table(imp_stacked$".imp")
+```
+# Exposure weights
+This accounts for exposure-outcome confounding (race/eth -> neuroimg). We estimate the probability of being Black or Hispanic (numerator), then the probability of being Black or Hispanic conditional on confounders of interest. Will start with age and gender as confounders here since there are very few true confounders of the E-O relationship (many are mediators). 
+References:
+- https://pmc.ncbi.nlm.nih.gov/articles/PMC3553264/
+- https://pubmed.ncbi.nlm.nih.gov/36938776/
+- https://pmc.ncbi.nlm.nih.gov/articles/PMC3710547
+
+## Numerator model for exposure
+```{r num exp, echo = T, results = 'hide'}
+# Prepping some lists/variables for for-loop 
+m <- max(imp_stacked$".imp") # number of imputed datasets
+num_race_wmhv <- list() # for fitted values
+num_race <- list() # numerator for each race/ethnicity 
+
+# For-loop to obtain numerator model for exposure 
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # multinomial regression to obtain unconditional prob 
+  # of being in a race/ethnic group
+  num_race_wmhv[[i]] <- multinom(as.factor(ethnicity) ~ 1,
+                                 data = data)
+  
+  # obtaining fitted values 
+  num_race[[i]] <- num_race_wmhv[[i]]$fitted.values %>%
+    as.data.frame() %>%
+    rename(num_white = White,
+           num_black = Black,
+           num_hispanic = Hispanic)
+  
+}
+
+# checking probabilities
+## should be the same since we're just estimating unconditioanl probs here 
+str(num_race)
+summary(num_race[[14]]) # switch index to check all datasets
+
+# cleaning up workspace for next section
+rm(i, m, data, num_race_wmhv)
+
+```
+## Denominator model for exposure
+```{r den exp, echo = T, results = 'hide'}
+# Denominator model: probability of being Black or Hispanic, conditional on age and gender 
+# Prepping some lists/variables for for-loop 
+m <- max(imp_stacked$".imp") # number of imputed datasets
+den_race_wmhv <- list() # for fitted values
+den_race <- list() # numerator for each race/ethnicity 
+
+# For-loop to obtain numerator model for exposure 
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # multinomial regression to obtain conditional prob 
+  # of being in a race/ethnic group
+  den_race_wmhv[[i]] <- multinom(as.factor(ethnicity) ~ 
+                            age_1 + # using visit 1 age here 
+                            as.factor(gender),
+                          data = data)
+  
+  # obtaining fitted values 
+  den_race[[i]] <- den_race_wmhv[[i]]$fitted.values %>%
+    as.data.frame() %>%
+    rename(den_white = White,
+           den_black = Black,
+           den_hispanic = Hispanic)
+  
+}
+
+# checking probabilities
+## should be the same since we're just estimating unconditioanl probs here 
+str(den_race)
+summary(den_race[[20]]) # switch index to check all datasets
+
+# cleaning up workspace for next section
+rm(i, m, data, den_race_wmhv)
+```
+## Calculating exposure weights
+```{r exp IPW, echo = T, results = 'hide'}
+# Prepping some lists/variables for for-loop 
+m <- max(imp_stacked$".imp") # number of imputed datasets
+imp_stacked_exp <- list() # list for exposure weights 
+
+# For-loop to obtain numerator model for exposure 
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # Creating stabilized IPW for exposure
+  imp_stacked_exp[[i]] <- data %>%
+  
+  # getting probabilities from the models above
+  bind_cols(num_race[[i]],
+            den_race[[i]]) %>% 
+
+  # creating denominators based on exposure status
+  mutate(num_exp = case_when(
+    ethnicity == "Black" ~ num_black,
+    ethnicity == "Hispanic" ~ num_hispanic,
+    ethnicity == "White" ~ num_white,
+    TRUE ~ NA)) %>%
+  
+  # creating denominators based on exposure status
+  mutate(den_exp = case_when(
+    ethnicity == "Black" ~ den_black,
+    ethnicity == "Hispanic" ~ den_hispanic,
+    ethnicity == "White" ~ den_white,
+    TRUE ~ NA)) %>% 
+  
+  # creating exposure weights
+  mutate(sw_exp = (num_exp/den_exp)) 
+  
+}
+```
+## Examining exposure IPWs
+Weights have a mean ~1 and none >10. 
+```{r check IPW exp, echo = T, results = 'hide'}
+# set default to raw mean differences for binary variables, standarized mean differences for continuous
+## switch index to check each dataset separately 
+summary(imp_stacked_exp[[5]]$num_exp) 
+describeBy(imp_stacked_exp[[5]]$num_exp, 
+           imp_stacked_exp[[5]]$ethnicity, 
+           mat = TRUE) 
+
+summary(imp_stacked_exp[[5]]$den_exp)
+describeBy(imp_stacked_exp[[5]]$den_exp, 
+           imp_stacked_exp[[5]]$ethnicity, 
+           mat = TRUE) 
+
+summary(imp_stacked_exp[[4]]$sw_exp) 
+describeBy(imp_stacked_exp[[2]]$sw_exp, 
+           imp_stacked_exp[[2]]$ethnicity, 
+           mat = TRUE) 
+
+bal.tab(ethnicity ~ age_2 + gender,
+        data = imp_stacked_exp[[10]],
+        weights = "sw_exp",
+        which.treat = .all)
+
+# cleaning up work space
+rm(i, m, num_race, den_race)
+```
+# Mediator weights
+This accounts for mediator-outcome confounding (HTN -> neuroimg). We estimate the probability of having hypertension, then the probability of having hypertension conditional on M-O confounders (age, gender, SES markers + physical activity + smoking + BMI). 
+
+## Numerator model for mediator
+```{r num med, echo = T, results = 'hide'}
+# Prepping some lists/variables for for-loop 
+m <- max(imp_stacked$".imp") # number of imputed datasets
+num_htn_wmhv <- list() # for fitted values
+num_med <- list() # numerator for htn 
+
+# For-loop to obtain numerator model for exposure 
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # multinomial regression to obtain unconditional prob 
+  # of being in a race/ethnic group
+  num_htn_wmhv[[i]] <- glm(as.factor(has_htn) ~ 1,
+                           family = binomial(link = "logit"),
+                           data = data)
+  
+  # obtaining fitted values 
+  num_med[[i]] <- num_htn_wmhv[[i]]$fitted.values %>%
+    as.data.frame() %>%
+  rename(num_med = ".")
+}
+
+# checking probabilities
+str(num_med)
+summary(num_med[[11]]) # switch index to check all datasets
+
+# cleaning up workspace for next section
+rm(i, m, data, num_htn_wmhv)
+```
+## Denominator model for mediator
+```{r den med, echo=TRUE, results='hide'}
+# Prepping some lists/variables for for-loop 
+m <- max(imp_stacked$".imp") # number of imputed datasets
+den_htn_wmhv <- list() # for fitted values
+den_med <- list() # denominator for htn
+
+# For-loop to obtain numerator model for exposure 
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # logistic regression to obtain conditional probability 
+  den_htn_wmhv[[i]] <- glm(as.factor(has_htn) ~
+                             as.factor(ethnicity) +
+                             age_1 + # using baseline age 
+                             as.factor(gender) +
+                             # SES variables 
+                             edu + 
+                             income +
+                             as.factor(hasnoinsurance) + 
+                             # proximal risk factors
+                             bmi +
+                             rapa_1_total + # physical act scores
+                             rapa_2_total + 
+                             as.factor(smkever) + 
+                             # lab values for cardiometabolic RF
+                             ldl + 
+                             gluc + 
+                             a1c + 
+                             egfr_nonaa + 
+                             choltot + 
+                             # clinical dx vars
+                             as.factor(cdx_dyslipid) + 
+                             as.factor(cdx_dm), 
+                           family = binomial(link = "logit"),
+                           data = data)
+  
+  # obtaining fitted values 
+  den_med[[i]] <- den_htn_wmhv[[i]]$fitted.values %>% 
+    as.data.frame() %>%
+    rename(den_med = ".")
+}
+
+# checking probabilities
+## should be the same since we're just estimating unconditioanl probs here 
+str(den_med)
+summary(den_med[[20]]) # switch index to check all datasets
+
+# cleaning up workspace for next section
+rm(i, m, data, den_htn_wmhv)
+```
+## Calculating mediator weights
+```{r med IPW, echo=TRUE, results='hide'}
+# Prepping some lists/variables for for-loop 
+m <- max(imp_stacked$".imp") # number of imputed datasets
+imp_stacked_med <- list() # list for mediator weights 
+
+# For-loop to obtain numerator model for exposure 
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # Creating stabilized IPW for exposure
+  imp_stacked_med[[i]] <- data %>%
+  
+  # getting probabilities from the models above
+  bind_cols(num_med[[i]], 
+            den_med[[i]]) %>% 
+
+  # creating numerators based on mediator status
+  mutate(num_med_exp = case_when(
+    has_htn == 1 ~ num_med,
+    has_htn == 0 ~ 1-num_med,
+    TRUE ~ NA)) %>%
+  
+  # creating denominators based on mediator status
+  mutate(den_med_exp = case_when(
+    has_htn == 1 ~ den_med,
+    has_htn == 0 ~ 1-den_med,
+    TRUE ~ NA)) %>%
+  
+  # creating mediator weights
+  mutate(sw_med = (num_med_exp/den_med_exp))
+}
+
+```
+## Examining mediator IPWs
+Weights mean ~ 1, none >10. 
+```{r check IPW med, echo=TRUE, results='hide'}
+# switch index to check each dataset separately 
+summary(imp_stacked_med[[5]]$num_med_exp)
+describeBy(imp_stacked_med[[5]]$num_med_exp, 
+           imp_stacked_med[[5]]$has_htn, 
+           mat = TRUE) 
+
+summary(imp_stacked_med[[1]]$den_med_exp)
+describeBy(imp_stacked_med[[1]]$den_med_exp, 
+           imp_stacked_med[[1]]$has_htn, 
+           mat = TRUE) 
+
+summary(imp_stacked_med[[5]]$sw_med) # mean ~1, max 8.46
+describeBy(imp_stacked_med[[1]]$sw_med, 
+           imp_stacked_med[[1]]$has_htn, 
+           mat = TRUE) 
+
+bal.tab(has_htn ~ 
+          ethnicity +
+          age_1 + # using baseline age 
+          gender +
+          # SES variables 
+          edu + 
+          income +
+          hasnoinsurance + 
+          # proximal risk factors
+          bmi +
+          rapa_1_total + # physical act scores
+          rapa_2_total + 
+          smkever,
+        data = imp_stacked_med[[1]],
+        weights = "sw_med",
+        which.treat = .all)
+
+# cleaning up work space
+rm(i, m, num_med, den_med)
+```
+# Selection weights 
+This accounts for selection into the imaging cohort, in this case, who got an MRI and had WMHV measured. In theory, this would be the same as the AD-meta ROI CT measure, but we will estimate separately for each outcome because N's are still slightly different even for same imaging modality. 
+
+## Numerator model for selection
+```{r num sel, echo=TRUE, results='hide'}
+# Prepping some lists/variables for for-loop 
+m <- max(imp_stacked$".imp") # number of imputed datasets
+sel_wmhv <- list() # for fitted values
+num_sel_wmhv <- list() # numerator for selection into the subsample 
+
+# For-loop to obtain numerator model for exposure 
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # logistic regression, prob of being in the WMHV sample 
+  sel_wmhv[[i]] <- glm(as.factor(haswmhv2) ~ 1,
+                       family = binomial(link = "logit"),
+                       data = data)
+  
+  # obtaining fitted values 
+  num_sel_wmhv[[i]] <- sel_wmhv[[i]]$fitted.values %>%
+    as.data.frame() %>%
+  rename(num_sel = ".")
+}
+
+# checking probabilities
+str(num_sel_wmhv)
+summary(num_sel_wmhv[[5]]) # switch index to check all datasets
+
+# cleaning up workspace for next section
+rm(i, m, data, sel_wmhv)
+```
+## Denominator model for selection 
+```{r den sel, echo=TRUE, results='hide'}
+# Prepping some lists/variables for for-loop 
+m <- max(imp_stacked$".imp") # number of imputed datasets
+sel_wmhv <- list() # for fitted values
+den_sel_wmhv <- list() # numerator for selection into the subsample 
+
+# For-loop to obtain numerator model for exposure 
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # logistic regression, prob of being in the WMHV sample 
+  sel_wmhv[[i]] <- glm(as.factor(haswmhv2) ~ 
+                         as.factor(ethnicity) +
+                         age_1 + # using baseline age 
+                         as.factor(gender) +
+                         # SES variables 
+                         edu + 
+                         income +
+                         as.factor(hasnoinsurance) + 
+                         socsupptot + 
+                         # proximal risk factors
+                         bmi +
+                         rapa_1_total + # physical act scores
+                         rapa_2_total + 
+                         as.factor(smkever) + 
+                         gds_total + 
+                         # lab values for cardiometabolic RF
+                         ldl + 
+                         gluc + 
+                         a1c + 
+                         egfr_nonaa + 
+                         choltot + 
+                         # clinical dx vars
+                         as.factor(cdx_dep) +
+                         as.factor(cdx_dyslipid) + 
+                         as.factor(cdx_cvd) + 
+                         as.factor(cdx_dm), 
+                       family = binomial(link = "logit"),
+                       data = data)
+  
+  # obtaining fitted values 
+  den_sel_wmhv[[i]] <- sel_wmhv[[i]]$fitted.values %>%
+    as.data.frame() %>%
+  rename(den_sel = ".")
+}
+
+# checking probabilities
+str(den_sel_wmhv)
+summary(den_sel_wmhv[[20]]) # switch index to check all datasets
+
+# cleaning up workspace for next section
+rm(i, m, data, sel_wmhv)
+```
+## Calculating selection weights
+```{r sel IPW, echo=TRUE, results='hide'}
+# Prepping some lists/variables for for-loop 
+m <- max(imp_stacked$".imp") # number of imputed datasets
+imp_stacked_sel <- list() # list for selection weights 
+
+# For-loop to obtain numerator model for exposure 
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # Creating stabilized IPW for exposure
+  imp_stacked_sel[[i]] <- data %>%
+  
+  # getting probabilities from the models above
+  bind_cols(num_sel_wmhv[[i]], 
+            den_sel_wmhv[[i]]) %>% 
+
+  # creating numerators based on mediator status
+  mutate(num_sel_f = case_when(
+    haswmhv2 == 1 ~ num_sel,
+    haswmhv2 == 0 ~ 1-num_sel,
+    TRUE ~ NA)) %>%
+  
+  # creating denominators based on mediator status
+  mutate(den_sel_f = case_when(
+    haswmhv2 == 1 ~ den_sel,
+    haswmhv2 == 0 ~ 1-den_sel,
+    TRUE ~ NA)) %>%
+  
+  # creating mediator weights
+  mutate(sw_sel = (num_sel_f/den_sel_f))
+}
+```
+## Examining selection IPWs
+Weights mean ~ 1, max 11.9, will consider truncating. 
+```{r check sel med, echo=TRUE, results='hide'}
+# switch index to check each dataset separately 
+summary(imp_stacked_sel[[5]]$num_sel_f)
+describeBy(imp_stacked_sel[[5]]$num_sel_f, 
+           imp_stacked_sel[[5]]$haswmhv2, 
+           mat = TRUE) 
+
+summary(imp_stacked_sel[[5]]$den_sel_f)
+describeBy(imp_stacked_sel[[5]]$den_sel_f, 
+           imp_stacked_sel[[5]]$haswmhv2, 
+           mat = TRUE) 
+
+summary(imp_stacked_sel[[5]]$sw_sel) 
+describeBy(imp_stacked_sel[[1]]$sw_sel, 
+           imp_stacked_sel[[1]]$haswmhv2, 
+           mat = TRUE) 
+
+bal.tab(haswmhv2 ~ 
+          ethnicity +
+          age_1 + # using baseline age 
+          gender +
+          # SES variables 
+          edu + 
+          income +
+          hasnoinsurance + 
+          socsupptot + 
+          # proximal risk factors
+          bmi +
+          rapa_1_total + # physical act scores
+          rapa_2_total + 
+          smkever + 
+          gds_total + 
+          # lab values for cardiometabolic RF
+          ldl + 
+          gluc + 
+          a1c + 
+          egfr_nonaa + 
+          choltot + 
+          # clinical dx vars
+          cdx_dep +
+          cdx_dyslipid + 
+          cdx_cvd +
+          cdx_dm,
+        data = imp_stacked_sel[[5]],
+        weights = "sw_sel",
+        which.treat = .all)
+
+# cleaning up work space
+rm(i, m, data, num_sel_wmhv, den_sel_wmhv)
+```
+
+# Creating total weights
+For exposure weights, we will multiply exposure * selection weights. For the mediator weights, we include exposure, mediator, and selection weights. 
+```{r IPW with all, echo=TRUE, results='hide'}
+# Prepping some lists/variables for for-loop 
+m <- max(imp_stacked$".imp") # number of imputed datasets
+imp_stacked_wmhv <- list() # list for mediator weights 
+
+# For-loop to obtain numerator model for exposure 
+for (i in seq_along(1:m)){
+  
+  # extract one imputed dataset at a time
+  data <- imp_stacked %>% filter(`.imp` == i)
+  
+  # Creating stabilized IPW for exposure
+  imp_stacked_wmhv[[i]] <- data %>%
+    
+    # getting probabilities from the models above
+    bind_cols(sw_exp = imp_stacked_exp[[i]]$sw_exp, 
+              sw_med = imp_stacked_med[[i]]$sw_med,
+              sw_sel = imp_stacked_sel[[i]]$sw_sel) %>% 
+    
+    # creating final exposure weights
+    mutate(sw_exp_sel = (sw_exp*sw_sel)) %>% 
+    
+    ## truncating at 1st and 99th percentile 
+    mutate(sw_exp_f = case_when(
+      sw_exp_sel < quantile(sw_exp_sel, 0.01) ~ quantile(sw_exp_sel, 0.01),
+      sw_exp_sel > quantile(sw_exp_sel, 0.99) ~ quantile(sw_exp_sel, 0.99),
+      TRUE ~ sw_exp_sel)) %>% 
+    
+    # creating final mediator weights
+    mutate(sw_med_sel = (sw_exp*sw_med*sw_sel)) %>% 
+    
+    ## truncating at 1st and 99th percentile 
+    mutate(sw_med_f = case_when(
+      sw_med_sel < quantile(sw_med_sel, 0.01) ~ quantile(sw_med_sel, 0.01),
+      sw_med_sel > quantile(sw_med_sel, 0.99) ~ quantile(sw_med_sel, 0.99),
+      TRUE ~ sw_med_sel)) 
+  
+}
+```
+## Examining final IPWs
+Final exposure weights mean ~ 1, but max ranging 12-15, will truncate at 1%tile and 99%tile (see above section for edits to code).
+
+Final exposure weights mean ~ 1, but max ranging in 40s, will truncate (see above section for edits to code).
+```{r check IPW all, echo=TRUE, results='hide'}
+# switch index to check all datasets
+summary(imp_stacked_wmhv[[5]]$sw_exp_f) 
+describeBy(imp_stacked_wmhv[[5]]$sw_exp_f, 
+           imp_stacked_wmhv[[5]]$ethnicity, 
+           mat = TRUE) 
+
+summary(imp_stacked_wmhv[[4]]$sw_med_f) 
+describeBy(imp_stacked_wmhv[[5]]$sw_med_f, 
+           imp_stacked_wmhv[[5]]$ethnicity, 
+           mat = TRUE) 
+
+bal.tab(ethnicity ~
+          age_1 + # using baseline age 
+          gender +
+          # SES variables 
+          edu + 
+          income +
+          hasnoinsurance + 
+          socsupptot + 
+          # proximal risk factors
+          bmi +
+          rapa_1_total + # physical act scores
+          rapa_2_total + 
+          smkever + 
+          gds_total + 
+          # lab values for cardiometabolic RF
+          ldl + 
+          gluc + 
+          a1c + 
+          egfr_nonaa + 
+          choltot + 
+          # clinical dx vars
+          cdx_dep +
+          cdx_dyslipid + 
+          cdx_cvd +
+          cdx_dm,
+        data = imp_stacked_wmhv[[5]],
+        weights = "sw_exp_f",
+        which.treat = .all)
+
+# visualizing balance before and after weighting for exposure weights
+## For exposure weights 
+exp_cov <- do.call(rbind, imp_stacked_wmhv) %>% 
+  select(c("age_1", "ethnicity", "gender", "edu", "income", "hasnoinsurance", "socsupptot", "bmi", "rapa_1_total", "rapa_2_total", "smkever", "gds_total", "ldl", "gluc", "a1c", "egfr_nonaa", "choltot", "cdx_dep", "cdx_dyslipid", "cdx_cvd", "cdx_dm", "sw_exp_f"))
+
+cov_names <- data.frame(
+  old = c("age_1", "ethnicity", "gender", "edu", "income", "hasnoinsurance", "socsupptot", "bmi", "rapa_1_total", "rapa_2_total", "smkever", "gds_total", "ldl", "gluc", "a1c", "egfr_nonaa", "choltot", "cdx_dep", "cdx_dyslipid", "cdx_cvd", "cdx_dm", "sw_exp_f"),
+  new = c("Age (Years)", "Race/Ethnicity", "Sex/Gender", "Years of Education", "Income", "Has No Insurance", "Social Support Score", "BMI", "Physical Activity Score (Aerobic)", "Physical Activity Score (Strength)", "Ever Smoked", "GDS Score", "LDL-C", "Glucose", "A1C", "EGFR-nonAA", "Total Cholesterol", "Depression", "Dyslipidemia", "CVD", "Diabetes", "IPW for Exposure") ) 
+
+love.plot(ethnicity ~
+          age_1 + # using baseline age 
+          gender +
+          # SES variables 
+          edu + 
+          income +
+          hasnoinsurance + 
+          socsupptot + 
+          # proximal risk factors
+          bmi +
+          rapa_1_total + # physical act scores
+          rapa_2_total + 
+          smkever + 
+          gds_total + 
+          # lab values for cardiometabolic RF
+          ldl + 
+          gluc + 
+          a1c + 
+          egfr_nonaa + 
+          choltot + 
+          # clinical dx vars
+          cdx_dep +
+          cdx_dyslipid + 
+          cdx_cvd +
+          cdx_dm,
+          weights = "sw_exp_f",
+          data = exp_cov,
+          threshold = c(m=0.2),
+          var.names = cov_names,
+          stars = "raw", 
+          which.treat = .all,
+          title = "Covariate Balance for Exposure Weights (WMHV)") -> lp_exp_wmhv
+
+ggsave("./results/lp_exp_wmhv.jpeg",
+       dpi = 400,
+       plot = lp_exp_wmhv)
+
+## for mediator weights
+med_cov <- do.call(rbind, imp_stacked_wmhv) %>% 
+  select(c("age_1", "has_htn", "ethnicity", "gender", "edu", "income", "hasnoinsurance", "socsupptot", "bmi", "rapa_1_total", "rapa_2_total", "smkever", "gds_total", "ldl", "gluc", "a1c", "egfr_nonaa", "choltot", "cdx_dep", "cdx_dyslipid", "cdx_cvd", "cdx_dm", "sw_med_f"))
+
+cov_names <- data.frame(
+  old = c("age_1", "has_htn", "ethnicity", "gender", "edu", "income", "hasnoinsurance", "socsupptot", "bmi", "rapa_1_total", "rapa_2_total", "smkever", "gds_total", "ldl", "gluc", "a1c", "egfr_nonaa", "choltot", "cdx_dep", "cdx_dyslipid", "cdx_cvd", "cdx_dm", "sw_med_f"),
+  new = c("Age (Years)", "Has HTN", "Race/Ethnicity", "Sex/Gender", "Years of Education", "Income", "Has No Insurance", "Social Support Score", "BMI", "Physical Activity Score (Aerobic)", "Physical Activity Score (Strength)", "Ever Smoked", "GDS Score", "LDL-C", "Glucose", "A1C", "EGFR-nonAA", "Total Cholesterol", "Depression", "Dyslipidemia", "CVD", "Diabetes", "IPW for Mediator") ) 
+
+set.cobalt.options(binary='raw', continuous='std')
+love.plot(has_htn ~
+          age_1 + # using baseline age 
+          gender +
+          ethnicity + 
+          # SES variables 
+          edu + 
+          income +
+          hasnoinsurance + 
+          socsupptot + 
+          # proximal risk factors
+          bmi +
+          rapa_1_total + # physical act scores
+          rapa_2_total + 
+          smkever + 
+          gds_total + 
+          # lab values for cardiometabolic RF
+          ldl + 
+          gluc + 
+          a1c + 
+          egfr_nonaa + 
+          choltot + 
+          # clinical dx vars
+          cdx_dep +
+          cdx_dyslipid + 
+          cdx_cvd +
+          cdx_dm,
+          weights = "sw_med_f",
+          data = med_cov,
+          threshold = c(m=0.2),
+          var.names = cov_names,
+          stars = "raw", 
+          which.treat = .all,
+          title = "Covariate Balance for HTN Mediator Weights (WMHV)") -> lp_med_wmhv
+
+ggsave("./results/lp_med_wmhv.jpeg",
+       dpi = 400,
+       plot = lp_med_wmhv)
+
+# table of weights per imputed dataset
+do.call(rbind, imp_stacked_wmhv) %>%
+  as.data.frame() %>% 
+  group_by(`.imp`) %>% 
+  summarise(mean_expIPW = mean(sw_exp_f),
+            sd_expIPW = sd(sw_exp_f),
+            min_expIPW = min(sw_exp_f),
+            max_expIPW = max(sw_exp_f),
+            mean_medIPW = mean(sw_med_f),
+            sd_medIPW = sd(sw_med_f),
+            min_medIPW = min(sw_med_f),
+            max_medIPW = max(sw_med_f)) %>%
+  rename("Mean (Exposure IPW)" = mean_expIPW,
+         "SD (Exposure IPW)" = sd_expIPW,
+         "Min (Exposure IPW)" = min_expIPW,
+         "Max (Exposure IPW)" = max_expIPW,
+         "Mean (Mediator IPW)" = mean_medIPW,
+         "SD (Mediator IPW)" = sd_medIPW,
+         "Min (Mediator IPW)" = min_medIPW,
+         "Max (Mediator IPW)" = max_medIPW,
+         "Imputation" = `.imp`) %>% 
+  mutate_if(is.numeric, round, 2) %>% 
+  gt() -> tbl_wgts_wmhv
+
+# saving tables
+gtsave(tbl_wgts_wmhv, file = "./results/tbl_wgts_wmhv.docx")
+
+# saving datasets
+save(imp_stacked_wmhv, file = "./analysis data/imp_stacked_wmhv.Rdata")
+
+# cleaning up workspace
+rm(imp_stacked_exp, imp_stacked_med, imp_stacked_sel, exp_cov, med_cov, lp_exp_wmhv, lp_med_wmhv, cov_names, data)
+```
+# Estimating TE and CDEs for WMHV 
+## Total effect
+For total effect, we can model logWMHV_2 as a function of race/ethnicity, weighted by the final exposure IPW (which includes the IPW for selection into the measurement of WMHV at visit 2).
+```{r te wmhv, echo=TRUE, results='hide'}
+# loading stacked imputed data 
+load("./analysis data/imp_stacked_wmhv.Rdata") 
+
+# creating survey design in order to use weights
+m <- length(imp_stacked_wmhv) # number of imputed datasets
+te_wmhv <- list() # list for mediator weights 
+
+# For-loop to estimate MSM for total effect of race/ethnicity on logWMHV
+for (i in seq_along(1:m)){
+  
+  # creating survey design to implement weights 
+  design_te_wmhv <- svydesign(ids = ~1, 
+                              weights = ~sw_exp_f, 
+                              data = imp_stacked_wmhv[[i]])
+  
+  # estimating total effect of race/ethnicity on log-transformed WMHV 
+  te_wmhv[[i]] <- svyglm(logwmhv_2 ~
+                           as.factor(ethnicity) +
+                           as.factor(mriscanner_2) + 
+                           scale(icv_1), # correcting for ICV 
+                         design = design_te_wmhv) 
+}
+
+# Pooling estimates across imputations 
+pool_te_wmhv <- as.mira(te_wmhv) %>% pool()
+
+# Making results presentable 
+te_wmhv_res <- summary(pool_te_wmhv, conf.int = TRUE) %>%
+  as.data.frame() %>% 
+  mutate("Estimate" = exp(estimate)) %>% 
+  mutate("LCL" = exp(conf.low)) %>% 
+  mutate("UCL" = exp(conf.high)) %>%
+  rename("p-value" = p.value) %>% 
+  mutate(across(is.numeric, round, 2)) %>%
+  mutate("Group" = case_when(
+    term == "as.factor(ethnicity)Black" ~ "Black",
+    term == "as.factor(ethnicity)Hispanic" ~ "Hispanic")) %>% 
+  select(Group, Estimate, LCL, UCL, "p-value") %>% 
+  filter(Group %in% c("Black", "Hispanic")) 
+
+te_wmhv_res %>% gt()
+
+# cleaning up workspace
+rm(i, m, data, design_te_wmhv, te_wmhv)
+
+```
+## Controlled direct effect
+For the CDE, we model logWMHV_2 as a function of the race/ethnicity, hypertension, and their interaction, weighted by the SW as calculated by the cumulative product of both the exposure, mediator, and selection weights. The estimate for the Black and Hispanic reflect the CDE of those exposures, holding HTN =0, in other words, what is the effect of race/ethnicity if we control hypertension. We also observe race/eth*HTN interactions (representing the additional WMHV if folks had HTN). 
+
+### Setting HTN = 0
+```{r cde htn0, echo=TRUE, results='hide'}
+# Prepping some lists/variables for for-loop 
+m <- length(imp_stacked_wmhv) # number of imputed datasets
+cde_htn0 <- list() # list for mediator weights, setting HTN=0 
+
+# For-loop to estimate MSM for CDEs of race/ethnicity on logWMHV, controlling for HTN
+for (i in seq_along(1:m)){
+  
+  # creating survey design to implement weights
+  design_cde_wmhv <- svydesign(ids = ~1, 
+                               weights = ~sw_med_f, 
+                               data = imp_stacked_wmhv[[i]])
+  
+  # estimating CDE of race/ethnicity on log-transformed WMHV, setting  HTN = 0 as the reference level (mediator and exp*med term drop from model when mediator=0)
+  cde_htn0[[i]] <- svyglm(logwmhv_2 ~
+                            as.factor(ethnicity)*as.factor(has_htn) +
+                            as.factor(mriscanner_2) + 
+                            scale(icv_1),
+                          design = design_cde_wmhv)
+}
+
+# Pooling estimates across imputations 
+pool_htn0 <- as.mira(cde_htn0) %>% pool()
+summary(pool_htn0)
+
+cde_htn0_res <- summary(pool_htn0, conf.int = TRUE) %>%
+  as.data.frame() %>% 
+  mutate("Estimate" = exp(estimate)) %>% 
+  mutate("LCL" = exp(conf.low)) %>% 
+  mutate("UCL" = exp(conf.high)) %>%
+  rename("p-value" = p.value) %>% 
+  mutate(across(is.numeric, round, 2)) %>%
+  mutate("Group" = case_when(
+    term == "as.factor(ethnicity)Black" ~ "Black",
+    term == "as.factor(ethnicity)Hispanic" ~ "Hispanic",
+    term == "as.factor(has_htn)1" ~ "Hypertension",
+    term == "as.factor(ethnicity)Black:as.factor(has_htn)1" ~ "Black*HTN",
+    term == "as.factor(ethnicity)Hispanic:as.factor(has_htn)1" ~ "Hispanic*HTN")) %>% 
+  select(Group, Estimate, LCL, UCL, "p-value") %>% 
+  filter(Group %in% c("Black", "Hispanic")) 
+
+cde_htn0_res %>% gt()
+```
+
+### Setting HTN = 1
+```{r cde htn1, echo=TRUE, results='hide'}
+# Prepping list
+cde_htn1 <- list() # list for mediator weights, setting HTN=1 
+imp_stacked_wmhv2 <- list() # list for data with has_htn level changed to reference = 1
+
+for (i in seq_along(1:m)){
+  
+  imp_stacked_wmhv2[[i]] <- imp_stacked_wmhv[[i]] %>%
+    mutate_at(c("has_htn"), 
+              factor, 
+              levels = c(1,0)) 
+  
+  # creating survey design to implement weights
+  design_cde_wmhv <- svydesign(ids = ~1, 
+                               weights = ~sw_med_f, 
+                               data = imp_stacked_wmhv2[[i]])
+  
+  # estimating CDE of race/ethnicity on log-transformed WMHV, where HTN = 1 as the reference level (mediator and exp*med term drop from model when mediator=1)
+  cde_htn1[[i]] <- svyglm(logwmhv_2 ~
+                            as.factor(ethnicity)*(has_htn-1) +
+                            as.factor(mriscanner_2) + 
+                            scale(icv_1),
+                          design = design_cde_wmhv)
+  
+}
+
+# Pooling estimates across imputations 
+pool_htn1 <- as.mira(cde_htn1) %>% pool()
+summary(pool_htn1)
+
+# Making results presentable 
+cde_htn1_res <- summary(pool_htn1, conf.int = TRUE) %>%
+  as.data.frame() %>% 
+  mutate("Estimate" = exp(estimate)) %>% 
+  mutate("LCL" = exp(conf.low)) %>% 
+  mutate("UCL" = exp(conf.high)) %>%
+  rename("p-value" = p.value) %>% 
+  mutate(across(is.numeric, round, 2)) %>%
+  mutate("Group" = case_when(
+    term == "as.factor(ethnicity)Black" ~ "Black",
+    term == "as.factor(ethnicity)Hispanic" ~ "Hispanic",
+    term == "has_htn0" ~ "Hypertension",
+    term == "as.factor(ethnicity)Black:has_htn0" ~ "Black*HTN",
+    term == "as.factor(ethnicity)Hispanic:has_htn0" ~ "Hispanic*HTN")) %>% 
+  select(Group, Estimate, LCL, UCL, "p-value") %>% 
+  filter(Group %in% c("Black", "Hispanic")) 
+
+cde_htn1_res %>% gt()
+
+# cleaning up workspace
+rm(i, m, data, design_cde_wmhv, cde_wmhv)
+```
+
+# Outputting WMHV results 
+## Table of results
+```{r res wmhv, echo=TRUE, results='hide'}
+wmhv_res <- bind_rows(te_wmhv_res,
+                      cde_htn0_res,
+                      cde_htn1_res) %>% 
+  gt() %>% 
+  tab_row_group(
+    label = "Controlled Direct Effects of Race/Ethnicity on WMHV, Setting HTN = 1",
+    rows = 5:6) %>% 
+  tab_row_group(
+    label = "Controlled Direct Effects of Race/Ethnicity on WMHV, Setting HTN = 0",
+    rows = 3:4) %>% 
+  tab_row_group(
+    label = "Total Effects of Race/Ethnicity on WMHV",
+    rows = 1:2) 
+  
+wmhv_res
+
+save(wmhv_res, file = "./results/wmhv_res") # saving gt version, in case we want to merge gt
+
+wmhv_res %>% gtsave("./results/wmhv_res.docx")
+```
